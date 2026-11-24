@@ -77,8 +77,16 @@ from services.knowledge.entities.knowledge_entities import InfoList as _dataset_
 from services.knowledge.entities.knowledge_entities import (
     KnowledgeConfig as _dataset_service_lock_not_owned_KnowledgeConfig,
 )
+from services.knowledge.entities.segments import SegmentUpdateArgs
 from services.knowledge.resource_scope import DatasetRef, DocumentRef, SegmentRef
-from services.knowledge.segments.application import SegmentIndex, SegmentIndexingState, SegmentMutationService
+from services.knowledge.segments.application import (
+    SegmentDatasetRecord,
+    SegmentDocumentRecord,
+    SegmentIndex,
+    SegmentIndexingState,
+    SegmentMutationScope,
+    SegmentMutationService,
+)
 from tests.helpers.unit.config_override import config_overrides_context
 from tests.helpers.unit.model_factories import make_account, make_dataset, make_document, make_tenant, make_upload_file
 from tests.helpers.unit.services.dataset_service_test_helpers import Account as _dataset_service_document_Account
@@ -4712,3 +4720,94 @@ class TestDatasetServiceSegmentCases:
                 segment_ids=[segment.id for segment in segments],
                 keywords_list=[["key"], None],
             )
+
+        def test_single_and_multi_create_segment_share_one_per_document_lock(
+            self, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]
+        ) -> None:
+            """Single and batch segment creation must serialize on the same lock.
+
+            Regression test for #39022: the single-create path and the batch
+            path each read ``max(position)`` and insert at ``max + 1``. If they
+            use different per-document lock names, a concurrent single create
+            and batch create can both read the same max and commit duplicate
+            positions. Both paths must therefore acquire the same lock name.
+            """
+            dataset = _dataset_service_segment_dataset()
+            document = _document(word_count=0)
+            sqlite_session.add_all([dataset, document, _segment(segment_id="existing")])
+            sqlite_session.commit()
+
+            lock_names: list[str] = []
+
+            class RecordingLock:
+                def __init__(self, name: str) -> None:
+                    lock_names.append(name)
+
+                def __enter__(self) -> None:
+                    return None
+
+                def __exit__(self, *args: object) -> bool:
+                    return False
+
+            index = create_autospec(SegmentIndex, instance=True, spec_set=True)
+            index.count_tokens.return_value = 0
+            indexing_state = create_autospec(SegmentIndexingState, instance=True, spec_set=True)
+            indexing_state.lock.side_effect = lambda name, **_kwargs: RecordingLock(name)
+            mutations = SegmentMutationService(
+                store=SQLAlchemySegmentRepository(session_factory=sqlite_session_factory),
+                index=index,
+                text_hash=lambda text: text,
+                indexing_state=indexing_state,
+            )
+            mutations.create_segment(
+                SegmentMutationScope(
+                    dataset=SegmentDatasetRecord(
+                        id="dataset-1",
+                        workspace_id="tenant-1",
+                        indexing_technique="economy",
+                        embedding_model_provider=None,
+                        embedding_model=None,
+                    ),
+                    document=SegmentDocumentRecord(
+                        id="document-1",
+                        dataset_id="dataset-1",
+                        workspace_id="tenant-1",
+                        doc_form="paragraph_index",
+                    ),
+                ),
+                actor_id="user-1",
+                args=SegmentUpdateArgs(content="single"),
+            )
+
+            embedding_model = SimpleNamespace(get_text_embedding_num_tokens=lambda *, texts: [len(texts) + 1])
+            with (
+                _dataset_service_segment_patch(
+                    "services.knowledge.dataset_service.current_user", _dataset_service_segment_account()
+                ),
+                _dataset_service_segment_patch("services.knowledge.dataset_service.ModelManager") as manager_cls,
+                _dataset_service_segment_patch(
+                    "services.knowledge.dataset_service.redis_client.lock",
+                    new=lambda name, **_kwargs: RecordingLock(name),
+                ),
+            ):
+                manager_cls.for_tenant.return_value.get_model_instance.return_value = embedding_model
+                segments = SegmentService.multi_create_segment(
+                    [{"content": "batch-1"}, {"content": "batch-2"}],
+                    document,
+                    dataset,
+                    sqlite_session,
+                    mutations=mutations,
+                )
+
+            assert lock_names == [
+                "add_segment_lock_document_id_document-1",
+                "add_segment_lock_document_id_document-1",
+            ]
+            assert segments is not None
+            assert [segment.position for segment in segments] == [3, 4]
+            positions = sqlite_session.scalars(
+                select(DocumentSegment.position)
+                .where(DocumentSegment.document_id == "document-1")
+                .order_by(DocumentSegment.position)
+            ).all()
+            assert positions == [1, 2, 3, 4]

@@ -3551,7 +3551,12 @@ class SegmentService:
         actor_id = current_user.id
         document_ref = scope.document.ref
         session.commit()
-        lock_name = f"multi_add_segment_lock_document_id_{document_ref.document_id}"
+        # Use the same per-document lock as SegmentMutationService.create_segment
+        # (see services/knowledge/segments/application.py). Both paths read
+        # max(position) and insert at max + 1, so a distinct lock name here
+        # would let a concurrent single create and batch create commit
+        # duplicate positions (see #39022).
+        lock_name = f"add_segment_lock_document_id_{document_ref.document_id}"
         increment_word_count = 0
         try:
             with redis_client.lock(lock_name, timeout=600):

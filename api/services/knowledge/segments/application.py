@@ -710,6 +710,9 @@ class SegmentMutationService:
         segment_ref = scope.document.ref.segment(str(uuid4()))
         saved = False
         try:
+            # Keep this lock name in sync with SegmentService.multi_create_segment:
+            # both paths read max(position) and insert at max + 1, so they must
+            # serialize on the same per-document lock (see #39022).
             with self._indexing_state.lock(f"add_segment_lock_document_id_{scope.document.id}", timeout=600):
                 self._store.save_segment(
                     segment_ref,
